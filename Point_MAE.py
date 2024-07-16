@@ -48,28 +48,77 @@ class Encoder(nn.Module):   ## Embedding module
         feature_global = torch.max(feature, dim=2, keepdim=False)[0] # BG 1024
         return feature_global.reshape(bs, g, self.encoder_channel)
 
+def knn(x, k):
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
+    return idx
+    
+def get_graph_feature(x, k=20, idx=None, dim9=False):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        if dim9 == False:
+            idx = knn(x, k=k)  # (batch_size, num_points, k)
+        else:
+            idx = knn(x[:, 6:], k=k)
+    device = torch.device('cuda')
+
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+
+    idx = idx + idx_base
+
+    idx = idx.view(-1)
+
+    _, num_dims, _ = x.size()
+
+    x = x.transpose(2, 1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+
+    return feature  # (batch_size, 2*num_dims, num_points, k)
 
 class CenterAutoencoder(nn.Module):
-    def __init__(self, config, num_group, num_query=224): #PoinTr 코드에서 query 224개로 씀
+    def __init__(self, config, num_group, num_query=76, k=20): #PoinTr 코드에서 query 224개로 씀
         super().__init__()
         self.num_group = num_group
         self.num_query = num_query
+        self.k = k
+
+        self.trans_dim = config.transformer_config.trans_dim
+        
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(self.trans_dim)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv4 = nn.Sequential(nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
+                                   self.bn4,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv5 = nn.Sequential(nn.Conv1d(512, self.trans_dim, kernel_size=1, bias=False),
+                                   self.bn5,
+                                   nn.LeakyReLU(negative_slope=0.2))
         self.encoder_channel = config.transformer_config.encoder_dims
         self.mask_ratio = config.transformer_config.mask_ratio
         self.num_mask = int(self.num_group*self.mask_ratio) 
-        self.trans_dim = config.transformer_config.trans_dim
-        self.first_conv = nn.Sequential(
-            nn.Conv1d(3, 128, 1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(128, 256, 1)
-        )
-        self.second_conv = nn.Sequential(
-            nn.Conv1d(512, 512, 1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(512, self.trans_dim, 1)
-        )
+        
         self.mlp_center = nn.Sequential(
             nn.Linear(self.trans_dim, 1024),
             nn.BatchNorm1d(1024),
@@ -83,20 +132,36 @@ class CenterAutoencoder(nn.Module):
     def forward(self, centers):
         # center BxMx3 
         centers = centers.unsqueeze(0).permute(0,2,1)
-        x = self.first_conv(centers)
-        _,_,N = x.shape
-        x_global = torch.max(x,dim=2,keepdim=True)[0].expand(-1,-1,N)
-        x = torch.cat([x, x_global], dim=1)
-        x = self.second_conv(x) #feature 뽑기 x BxMx384
+        
+        x = get_graph_feature(centers, k=self.k)  # (batch_size, 3, num_points) -> (batch_size, 3*2, num_points, k)
+        x = self.conv1(x)  # (batch_size, 3*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x1 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+
+        x = get_graph_feature(x1, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = self.conv2(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 64, num_points, k)
+        x2 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
+
+        x = get_graph_feature(x2, k=self.k)  # (batch_size, 64, num_points) -> (batch_size, 64*2, num_points, k)
+        x = self.conv3(x)  # (batch_size, 64*2, num_points, k) -> (batch_size, 128, num_points, k)
+        x3 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 128, num_points, k) -> (batch_size, 128, num_points)
+
+        x = get_graph_feature(x3, k=self.k)  # (batch_size, 128, num_points) -> (batch_size, 128*2, num_points, k)
+        x = self.conv4(x)  # (batch_size, 128*2, num_points, k) -> (batch_size, 256, num_points, k)
+        x4 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 256, num_points, k) -> (batch_size, 256, num_points)
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)  # (batch_size, 64+64+128+256, num_points)
+
+        x = self.conv5(x)  # (batch_size, 64+64+128+256, num_points) -> (batch_size, emb_dims, num_points)
+        
         x = x.permute(0,2,1).squeeze()
-        print(x.shape)
+
         # max-pooling
         max_input = self.mlp_center(x).permute(1,0)
         print(max_input.shape)
         coarse_point = torch.max(max_input,dim=1,keepdim=True)[0] # Bx(3*q)
         coarse_point = coarse_point.view(-1,3,self.num_mask)
         coarse_point = coarse_point.permute(0,2,1) # Bx3xq -> Bxqx3
-        
+
         return coarse_point
 
         
