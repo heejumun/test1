@@ -50,7 +50,7 @@ class Encoder(nn.Module):   ## Embedding module
 
 
 class CenterAutoencoder(nn.Module):
-    def __init__(self, config, num_group, num_query=224): #PoinTr 코드에서 query 224개로 씀
+    def __init__(self, config, num_group, num_query=144): #PoinTr 코드에서 query 224개로 씀
         super().__init__()
         self.num_group = num_group
         self.num_query = num_query
@@ -89,8 +89,11 @@ class CenterAutoencoder(nn.Module):
         x = torch.cat([x, x_global], dim=1)
         x = self.second_conv(x) #feature 뽑기 x BxMx384
         x = x.permute(0,2,1).squeeze()
+        #print(x.shape)
         # max-pooling
-        coarse_point = torch.max(self.mlp_center(x))[0] # Bx(3*q)
+        max_input = self.mlp_center(x).permute(1,0)
+        #print(max_input.shape)
+        coarse_point = torch.max(max_input,dim=1,keepdim=True)[0] # Bx(3*q)
         coarse_point = coarse_point.view(-1,3,self.num_query)
         coarse_point = coarse_point.permute(0,2,1) # Bx3xq -> Bxqx3
         
@@ -306,7 +309,7 @@ class MaskTransformer(nn.Module):
             mask : B G (bool)
         '''
         # skip the mask
-        if noaug or self.mask_ratio == 0:
+        if noaug or self.mask_ratio == 0 or vis:
             return torch.zeros(center.shape[:2]).bool()
         # mask a continuous part
         mask_idx = []
@@ -449,7 +452,7 @@ class Point_MAE(nn.Module):
             N : num input point 
             M : num mask        """
         neighborhood, center = self.group_divider(pts) # pts (BxNx3) | neighborhood (BxGxSx3) | center (BxGx3)
-        x_vis, mask = self.MAE_encoder(neighborhood, center) # x_vis (Bx[G-M]xSxC) : C = 384 | mask (BxG) : boolean
+        x_vis, mask = self.MAE_encoder(neighborhood, center, vis) # x_vis (Bx[G-M]xSxC) : C = 384 | mask (BxG) : boolean
         B, _, C = x_vis.shape
         
         if is_training:
@@ -457,7 +460,7 @@ class Point_MAE(nn.Module):
             pred_center = self.center_pred(center[~mask])
         else:
             # inference일 때는 center prediction input : center
-            pred_center = self.center_pred(center)
+            pred_center = self.center_pred(center.squeeze())
         
         # positional embedding 
         pos_emd_vis = self.decoder_pos_embed(center[~mask]).reshape(B, -1, C)
